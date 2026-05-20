@@ -1,0 +1,6 @@
+{
+  "_comment": "High-impact US economic events. Trading is blocked from 30 min BEFORE to 15 min AFTER each event time. 'time' must be ISO 8601 UTC. 'name' is shown in last_scan_result. 'type' is one of NFP / FOMC / CPI / PPI. Edit this file and the scanner will pick changes up within ~60 seconds without restart. Remove events older than today to keep it short.",
+  "_format_example": {"time": "2026-05-08T12:30:00Z", "name": "US NFP Apr 2026", "type": "NFP"},
+  "events": [
+  ]
+}

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- LumixTrade mark: refracted 'L' chart-prism. Amber primary on black, glowing edge. -->
+  <defs>
+    <linearGradient id="lx-g" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"  stop-color="#FFD68A"/>
+      <stop offset="55%" stop-color="#F5A524"/>
+      <stop offset="100%" stop-color="#A06318"/>
+    </linearGradient>
+    <linearGradient id="lx-rise" x1="0" y1="64" x2="64" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"  stop-color="#F5A524" stop-opacity="0.0"/>
+      <stop offset="60%" stop-color="#F5A524" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#FFE7B5"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0A0907"/>
+  <!-- L bar -->
+  <path d="M16 12 H22 V46 H46 V52 H16 Z" fill="url(#lx-g)"/>
+  <!-- ascending chart line piercing the L -->
+  <path d="M14 52 L26 40 L36 46 L52 22"
+        stroke="url(#lx-rise)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- tick dot at apex -->
+  <circle cx="52" cy="22" r="2.6" fill="#FFE7B5"/>
+  <!-- tiny corner spark -->
+  <path d="M44 18 L50 18 L50 24" stroke="#F5A524" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+</svg>
