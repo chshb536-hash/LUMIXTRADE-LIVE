@@ -38,7 +38,7 @@ def validate_candles(
     now_ms: int,
     *,
     max_stale_multiplier: float = 3.0,
-    max_gap_multiplier: float = 2.0,
+    max_gap_multiplier: float = 5.0,
     abnormal_atr_multiplier: float = 5.0,
     min_candles: int = 60,
 ) -> ValidationResult:
@@ -52,6 +52,8 @@ def validate_candles(
       • OHLC inversion (h < l, h < max(o,c), l > min(o,c))
       • stale data (last candle older than max_stale_multiplier × timeframe)
       • abnormal gaps (consecutive bars > max_gap_multiplier × timeframe)
+        — small 1-2 bar gaps are tolerated (broker holes are normal); only
+          large gaps (> 5× tf) within a single session block trading.
       • abnormal ATR explosion (last bar TR > abnormal_atr_multiplier × median TR)
     """
     if not candles:
@@ -72,6 +74,7 @@ def validate_candles(
             return ValidationResult(False, "ohlc_inversion", {"index": i})
 
     # 2) Timestamp monotonicity + duplicates + gaps
+    soft_gaps = 0
     for i in range(1, n):
         dt = candles[i]["t"] - candles[i - 1]["t"]
         if dt <= 0:
@@ -81,7 +84,12 @@ def validate_candles(
             # weekend/holiday gap is normal — skip if dt >= 36h (Sat 00:00 → Sun close)
             if dt < 36 * 3600 * 1000:
                 return ValidationResult(False, "missing_candles",
-                                        {"index": i, "gap_minutes": dt / 60_000})
+                                        {"index": i, "gap_minutes": dt / 60_000,
+                                         "tf_minutes": tf_ms / 60_000})
+        elif dt > tf_ms * 2.0:
+            # Tolerated small broker hole (1-2 bars). Count it for diagnostics
+            # but do not block trading.
+            soft_gaps += 1
 
     # 3) Staleness — last candle's *close* should be recent enough to act on
     last_t = candles[-1]["t"]
@@ -102,7 +110,8 @@ def validate_candles(
                                     {"last_tr": last_tr, "median_tr": med_tr,
                                      "ratio": last_tr / med_tr})
 
-    return ValidationResult(True, "ok", {"count": n, "last_age_min": age_ms / 60_000})
+    return ValidationResult(True, "ok", {"count": n, "last_age_min": age_ms / 60_000,
+                                          "soft_gaps": soft_gaps})
 
 
 def validate_spread(

@@ -64,3 +64,22 @@ A default admin bridge key was created and stored in `/app/memory/test_credentia
 - **P1** Replace placeholder `TWELVE_DATA_API_KEY` if any v1 strategy paths are re-enabled (v2 is MT5-bridge-native — key not strictly needed).
 - **P2** Wire MT5 bridge v1.6 on a Windows VPS using the bridge API key in `test_credentials.md`.
 - **P2** Configure `payment_instructions` (bank / USDT-TRC20 / USDT-ERC20 / BTC / PayPal) via admin endpoint.
+
+**2026-05-20 — Bridge v1.7 fix shipped (preview)**
+Reason: Production bots reported `data_unavailable:missing_candles` because the bridge only streamed the hardcoded `AURUM_STREAM_PAIRS` default (`XAUUSD:M15,EURUSD:M15,GBPUSD:M15,USDJPY:M15`) — M5 / H1 / H4 bots starved, and even M15 occasionally tripped a too-strict 2× gap validator.
+
+Changes:
+- `MIN_BRIDGE_VERSION` bumped from `1.6` → `1.7` (`server.py` + bridge file). Old bridges receive `bridge_outdated` warning + zero signals.
+- New `GET /api/bridge/stream-config` (auth: `x-aurum-bridge-key`) returns union of every (pair, timeframe) from the user's bots (active OR paused) plus any `higher_tf_confirmation` TF.
+- `aurum_bridge.py` v1.7 now calls `refresh_stream_pairs()` on every `push_candles()` tick (cached `AURUM_STREAM_CFG_INTERVAL=60s`). Falls back to env list only if endpoint unreachable.
+- `data_validation.py` softened: `max_gap_multiplier` default `2.0` → `5.0`. Gaps 2×–5× counted as `soft_gaps` (warning only, trading continues). Gaps > 5× still hard-fail with `missing_candles`.
+- New `GET /api/diag/candles?pair=&timeframe=` (auth: any logged-in user) — returns `{count, first_t, last_t, last_age_min, gap_count_2x, gap_count_5x, tf_ms}`.
+- Bridge file also synced to `/app/frontend/public/aurum_bridge.py` (the user-downloadable copy).
+
+Verified on preview:
+- `/api/bridge/stream-config` returns 5 (pair, tf) combos after creating 3 bots with mixed TFs + higher_tf_confirmation.
+- `/api/bridge-candles` accepts 150-bar XAUUSD M5 push → 150 written.
+- `/api/diag/candles?pair=XAUUSD&timeframe=M5` returns `count=150, gap_count_2x=0, gap_count_5x=0`.
+- Validation unit test: 2-bar M15 hole → `ok=True soft_gaps=1` (previously `ok=False missing_candles`). 6-bar hole → `ok=False missing_candles` (correctly still blocked).
+
+Production status: code is in preview only — user must hit **Deploy** to push to `auto-scan-bot.emergent.host` / `lumixtrade.live`.

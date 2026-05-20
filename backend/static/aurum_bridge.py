@@ -62,7 +62,7 @@ except ImportError:
 import requests
 
 # ----- config -----
-BRIDGE_VERSION = "1.6"
+BRIDGE_VERSION = "1.7"
 API_KEY  = os.environ.get("AURUM_API_KEY")
 API_URL  = (os.environ.get("AURUM_API_URL") or "").rstrip("/")
 MT5_LOGIN    = os.environ.get("MT5_LOGIN")
@@ -94,10 +94,48 @@ MAX_SLIPPAGE_PIPS = float(os.environ.get("AURUM_MAX_SLIPPAGE_PIPS", "8"))   # bl
 # How often to push OHLC candles to the server (seconds)
 CANDLES_PUSH_INTERVAL = float(os.environ.get("AURUM_CANDLES_PUSH_INTERVAL", "60"))
 CANDLES_PER_PAIR     = int(os.environ.get("AURUM_CANDLES_PER_PAIR", "200"))
-# Pairs / timeframes to stream — discovered from the user's bots via /bridge-bots OR
-# fallback to this static list. Override via env AURUM_STREAM_PAIRS="XAUUSD:M15,EURUSD:M15"
+# Pairs / timeframes to stream. v1.7: auto-discovered from the user's active bots via
+# /api/bridge/stream-config every STREAM_CFG_INTERVAL seconds. Falls back to the static
+# AURUM_STREAM_PAIRS env list ONLY when the endpoint is unreachable.
 STREAM_PAIRS_RAW = os.environ.get("AURUM_STREAM_PAIRS", "XAUUSD:M15,EURUSD:M15,GBPUSD:M15,USDJPY:M15")
-STREAM_PAIRS: List[tuple] = [tuple(s.strip().split(":")) for s in STREAM_PAIRS_RAW.split(",") if ":" in s]
+FALLBACK_STREAM_PAIRS: List[tuple] = [tuple(s.strip().split(":")) for s in STREAM_PAIRS_RAW.split(",") if ":" in s]
+STREAM_PAIRS: List[tuple] = list(FALLBACK_STREAM_PAIRS)
+STREAM_CFG_INTERVAL = float(os.environ.get("AURUM_STREAM_CFG_INTERVAL", "60"))
+LAST_STREAM_CFG_FETCH: float = 0.0
+
+
+def refresh_stream_pairs() -> None:
+    """v1.7: Pull the active (pair, timeframe) list from the server every 60s.
+    Bridge stays in sync with bot creation/deletion without VPS reconfig.
+    Silently keeps the previous list on transient failures."""
+    global STREAM_PAIRS, LAST_STREAM_CFG_FETCH
+    if time.time() - LAST_STREAM_CFG_FETCH < STREAM_CFG_INTERVAL:
+        return
+    LAST_STREAM_CFG_FETCH = time.time()
+    try:
+        r = requests.get(f"{API_URL}/bridge/stream-config",
+                         headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            log.warning("stream-config HTTP %s — keeping previous list (%d pairs)",
+                        r.status_code, len(STREAM_PAIRS))
+            return
+        data = r.json() or {}
+        items = data.get("pairs") or []
+        if not items:
+            # No active bots — fall back to env list so the bridge doesn't go silent.
+            STREAM_PAIRS = list(FALLBACK_STREAM_PAIRS)
+            log.info("stream-config: no active bots — using env fallback (%d pairs)",
+                     len(STREAM_PAIRS))
+            return
+        new_list = [(it["pair"].upper(), it["timeframe"].upper())
+                    for it in items if it.get("pair") and it.get("timeframe")]
+        if new_list and new_list != STREAM_PAIRS:
+            log.info("stream-config: refreshed — streaming %d (pair, tf) combos: %s",
+                     len(new_list),
+                     ", ".join(f"{p}:{tf}" for (p, tf) in new_list))
+            STREAM_PAIRS = new_list
+    except Exception as e:
+        log.warning("stream-config fetch failed: %s — keeping previous list", e)
 LAST_CANDLES_PUSH: float = 0.0
 OPEN_TICKET_OPENED_AT: Dict[int, float] = {}   # ticket -> unix ts when first seen
 TICKET_MAX_HOLD: Dict[int, int] = {}            # ticket -> max_hold_minutes (from signal)
@@ -673,8 +711,11 @@ _MT5_TF = {
 
 
 def push_candles() -> None:
-    """v1.6: stream OHLC bars for the user's bot symbols to the server every CANDLES_PUSH_INTERVAL sec."""
+    """v1.7: stream OHLC bars for the user's bot symbols to the server every CANDLES_PUSH_INTERVAL sec.
+    Pair list is auto-refreshed from /api/bridge/stream-config (see refresh_stream_pairs)."""
     global LAST_CANDLES_PUSH
+    # v1.7: keep STREAM_PAIRS in sync with the user's active bots on every tick.
+    refresh_stream_pairs()
     if time.time() - LAST_CANDLES_PUSH < CANDLES_PUSH_INTERVAL:
         return
     LAST_CANDLES_PUSH = time.time()

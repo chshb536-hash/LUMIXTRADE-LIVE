@@ -55,7 +55,7 @@ ACCESS_TOKEN_MINUTES = 60 * 24 * 7  # 7 days (matches UX of Supabase persistSess
 REFRESH_TOKEN_DAYS = 30
 # Minimum bridge version that's allowed to receive signals. Older bridges still get a
 # 200 OK heartbeat so they don't crash, but receive zero signals + a `warning` field.
-MIN_BRIDGE_VERSION = "1.6"
+MIN_BRIDGE_VERSION = "1.7"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@aurumfx.com")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Mohyuddin@123")
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
@@ -2316,6 +2316,87 @@ async def bridge_candles(body: BridgeCandleBatch, request: Request):
         return {"written": 0}
     written = await store_candles(body.pair, body.timeframe, body.rows)
     return {"written": written, "pair": body.pair.upper(), "timeframe": body.timeframe}
+
+
+@api.get("/bridge/stream-config")
+async def bridge_stream_config(request: Request):
+    """Bridge calls this every ~60s to discover which (pair, timeframe) pairs to
+    push candles for. Returns the union of every active bot's (pair, timeframe)
+    + any higher_tf_confirmation TF, for the bridge-key's owner.
+    Auth: x-aurum-bridge-key header.
+    """
+    key_row = await _bridge_key_auth(request)
+    user_id = key_row["user_id"]
+    pairs: set = set()
+    # Stream candles for ALL the user's bots (active OR paused) so that data
+    # is already populated the moment the user flips a bot active. Cheap on bw.
+    async for b in db.bots.find(
+        {"user_id": user_id},
+        {"_id": 0, "pair": 1, "timeframe": 1, "higher_tf_confirmation": 1},
+    ):
+        pair = (b.get("pair") or "").upper().strip()
+        tf = (b.get("timeframe") or "").upper().strip()
+        if pair and tf:
+            pairs.add((pair, tf))
+        htf = (b.get("higher_tf_confirmation") or "").upper().strip()
+        if pair and htf and htf != "OFF":
+            pairs.add((pair, htf))
+    items = [{"pair": p, "timeframe": tf} for (p, tf) in sorted(pairs)]
+    return {
+        "min_bridge_version": MIN_BRIDGE_VERSION,
+        "pairs": items,
+        "count": len(items),
+    }
+
+
+@api.get("/diag/candles")
+async def diag_candles(
+    pair: str,
+    timeframe: str,
+    user: dict = Depends(get_current_user),
+):
+    """Diagnostic: returns candle stats for a (pair, timeframe) in db.candles.
+    Open to any authenticated user — they can only see global storage shape,
+    not per-user data (candles are shared across all users of the same broker).
+    Returns: count, last_t, last_age_min, gap_count_2x, gap_count_5x, first_t.
+    """
+    pair = pair.upper().strip()
+    timeframe = timeframe.upper().strip()
+    tf_ms_map = {"M1": 60_000, "M5": 300_000, "M15": 900_000, "M30": 1_800_000,
+                 "H1": 3_600_000, "H4": 14_400_000, "D1": 86_400_000}
+    tf_ms = tf_ms_map.get(timeframe, 900_000)
+    cur = db.candles.find(
+        {"pair": pair, "timeframe": timeframe},
+        {"_id": 0, "t": 1},
+    ).sort("t", 1).limit(500)
+    ts = [int(r["t"]) async for r in cur]
+    if not ts:
+        return {
+            "pair": pair, "timeframe": timeframe, "count": 0,
+            "last_t": None, "last_age_min": None,
+            "first_t": None, "gap_count_2x": 0, "gap_count_5x": 0,
+            "message": "No candles in db for this (pair, timeframe). "
+                       "Bridge needs to push them — check AURUM_STREAM_PAIRS "
+                       "or use bridge v1.7 auto-discovery.",
+        }
+    gap2 = gap5 = 0
+    for i in range(1, len(ts)):
+        dt = ts[i] - ts[i - 1]
+        if dt > tf_ms * 5:
+            gap5 += 1
+        elif dt > tf_ms * 2:
+            gap2 += 1
+    last_t = ts[-1]
+    now_ms = int(now_utc().timestamp() * 1000)
+    last_age_min = (now_ms - last_t) / 60_000
+    return {
+        "pair": pair, "timeframe": timeframe,
+        "count": len(ts),
+        "first_t": ts[0], "last_t": last_t,
+        "last_age_min": round(last_age_min, 2),
+        "gap_count_2x": gap2, "gap_count_5x": gap5,
+        "tf_ms": tf_ms,
+    }
 
 
 # ---------- Notifications ----------
