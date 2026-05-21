@@ -57,8 +57,9 @@ def _swings(candles: List[Candle], left: int = 3, right: int = 3) -> Tuple[List[
     return highs, lows
 
 
-def _displacement(candles: List[Candle], atr_series: List[float], i: int) -> Optional[Side]:
-    """A 'displacement' candle = strong directional intent: body > 1.4× ATR AND
+def _displacement(candles: List[Candle], atr_series: List[float], i: int,
+                  body_mult: float = 1.4) -> Optional[Side]:
+    """A 'displacement' candle = strong directional intent: body > body_mult × ATR AND
     closes in the upper/lower 25% of its own range."""
     if i >= len(candles) or i < 1:
         return None
@@ -68,7 +69,7 @@ def _displacement(candles: List[Candle], atr_series: List[float], i: int) -> Opt
     c = candles[i]
     body = abs(c["c"] - c["o"])
     rng  = max(c["h"] - c["l"], 1e-9)
-    if body < a * 1.4:
+    if body < a * body_mult:
         return None
     pos_in_range = (c["c"] - c["l"]) / rng
     if c["c"] > c["o"] and pos_in_range > 0.75:
@@ -188,6 +189,33 @@ class StrategyV2Config:
     scalp_min_confidence: float = 0.55
     max_hold_minutes_scalp: int = 45
     max_hold_minutes_swing: int = 480  # 8h cap on swings
+    # v1.8 — Conservative live-forward filters. Toggled via STRATEGY_CONSERVATIVE env at server startup.
+    require_displacement: bool = False        # BOS only valid if a displacement bar confirms
+    require_fvg_for_bos: bool = False         # BOS-retest also needs FVG confluence
+    require_htf_alignment: bool = False       # drop signals that disagree with higher-TF trend
+    max_atr_ratio: float = 1.8                # reject when current ATR > X × 50-bar median
+    min_displacement_body_atr: float = 1.4    # body-size requirement for "displacement" bars
+
+
+def conservative_config() -> "StrategyV2Config":
+    """Returns a stricter config preset for the live-forward stabilisation phase.
+    Activated when STRATEGY_CONSERVATIVE=true is set in backend/.env (default ON).
+    """
+    return StrategyV2Config(
+        sl_atr=1.5,
+        tp_atr=3.0,
+        min_confidence=0.70,           # was 0.55 — only A+ setups
+        scalp_sl_atr=1.0,
+        scalp_tp_atr=2.0,              # widened from 1.5 (better RR profile)
+        scalp_min_confidence=0.70,
+        max_hold_minutes_scalp=30,
+        max_hold_minutes_swing=360,
+        require_displacement=True,
+        require_fvg_for_bos=True,
+        require_htf_alignment=True,
+        max_atr_ratio=1.5,
+        min_displacement_body_atr=1.7,  # stronger institutional bars only
+    )
 
 
 @dataclass
@@ -258,7 +286,7 @@ def generate_signal_v2(
     swing_h, swing_l = _swings(candles, left=3, right=3)
     bos = _last_bos(candles, swing_h, swing_l)
     sweep = _liquidity_sweep(candles, swing_h, swing_l)
-    disp = _displacement(candles, a, n - 1)
+    disp = _displacement(candles, a, n - 1, body_mult=cfg.min_displacement_body_atr)
     fvg = _fair_value_gap(candles, n - 1)
     squeeze = _bollinger_squeeze(candles)
     atr_med = statistics.median([x for x in a[-50:] if x > 0]) or a[-1]
@@ -296,12 +324,24 @@ def _setup_bos_retest(candles, cfg: StrategyV2Config, ef, es, r, a,
     if not bos:
         return None
     side: Side = bos["side"]
+    # v1.8 conservative: require a confirming displacement on BOS
+    if cfg.require_displacement and disp != side:
+        return None
+    # v1.8 conservative: require FVG confluence on BOS-retest
+    if cfg.require_fvg_for_bos and not (fvg and fvg[0] == side):
+        return None
+    # v1.8 conservative: reject violent regimes
+    if cfg.max_atr_ratio and ctx.atr_ratio > cfg.max_atr_ratio:
+        return None
     # HTF alignment — drop signals contradicting higher TF unless very strong displacement
     htf_aligned: Optional[bool] = None
     if htf_trend and htf_trend != "flat":
         want = "up" if side == "buy" else "down"
         htf_aligned = (htf_trend == want)
         if not htf_aligned and not disp:
+            return None
+        # v1.8 conservative: hard-block contra-HTF setups regardless of displacement
+        if cfg.require_htf_alignment and not htf_aligned:
             return None
     ctx.htf_aligned = htf_aligned
 

@@ -62,24 +62,46 @@ except ImportError:
 import requests
 
 # ----- config -----
-BRIDGE_VERSION = "1.7"
+BRIDGE_VERSION = "1.8"
 API_KEY  = os.environ.get("AURUM_API_KEY")
 API_URL  = (os.environ.get("AURUM_API_URL") or "").rstrip("/")
 MT5_LOGIN    = os.environ.get("MT5_LOGIN")
 MT5_PASSWORD = os.environ.get("MT5_PASSWORD")
 MT5_SERVER   = os.environ.get("MT5_SERVER")
 POLL_INTERVAL = float(os.environ.get("AURUM_POLL_INTERVAL", "5"))
+# v1.8: persistent rotating file log next to the script. Configurable via env.
+LOG_DIR  = os.environ.get("AURUM_LOG_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_FILE = os.path.join(LOG_DIR, "aurum_bridge.log")
+LOG_LEVEL = os.environ.get("AURUM_LOG_LEVEL", "INFO").upper()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+# Root logger: stream to console + rotating file (10 MB × 5 backups).
+os.makedirs(LOG_DIR, exist_ok=True)
+from logging.handlers import RotatingFileHandler  # noqa: E402
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+_root = logging.getLogger()
+_root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+# Clean any pre-existing handlers so we don't double-log when supervisor restarts the process.
+for _h in list(_root.handlers):
+    _root.removeHandler(_h)
+_sh = logging.StreamHandler(sys.stdout); _sh.setFormatter(_fmt); _root.addHandler(_sh)
+_fh = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+_fh.setFormatter(_fmt); _root.addHandler(_fh)
 log = logging.getLogger("aurum")
 
 if not (API_KEY and API_URL and MT5_LOGIN and MT5_PASSWORD and MT5_SERVER):
     log.error("Missing required env vars. See file header for setup.")
-    sys.exit(1)
+    sys.exit(2)  # exit 2 = config error (do NOT auto-restart for this)
 
 HEADERS = {"x-aurum-bridge-key": API_KEY, "Content-Type": "application/json"}
 TRACKED_TICKETS: Dict[int, str] = {}        # ticket -> signal_id
 SYMBOL_MAP: Dict[str, str] = {}              # base symbol (XAUUSD) -> broker symbol (XAUUSDm)
+BRIDGE_START_TS = time.time()
+# v1.8 — health counters/telemetry for heartbeat enrichment
+LAST_CANDLES_PUSH_AT: float = 0.0
+LAST_SIGNAL_RECEIVED_AT: float = 0.0
+LAST_MT5_RECONNECT_AT: float = 0.0
+MT5_RECONNECT_COUNT: int = 0
+LAST_LOOP_ERROR: str = ""
 
 # ---- v1.6: candle streaming + max-hold + spread/slippage protection ----
 # Per-pair max spread (in PRICE units, not pips). 0 disables. Override via env: AURUM_MAX_SPREAD_XAUUSD=0.5
@@ -184,6 +206,8 @@ PARTIAL_DONE: set = set()                    # tickets that have had their +1R p
 
 
 def mt5_init() -> bool:
+    """Initialize MT5 connection. Returns True on success.
+    v1.8: structured error logs so the watchdog can decide whether to restart."""
     if not mt5.initialize(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER):
         log.error("MT5 init failed: %s", mt5.last_error())
         return False
@@ -194,6 +218,53 @@ def mt5_init() -> bool:
     log.info("Connected to MT5 #%s on %s · balance %s %s · equity %s",
              info.login, info.server, info.balance, info.currency, info.equity)
     return True
+
+
+def mt5_is_healthy() -> bool:
+    """v1.8: best-effort liveness check on the MT5 terminal connection.
+    Considered unhealthy if terminal_info or account_info return None, or if the
+    terminal reports `connected=False` (broker disconnect / weekend gap)."""
+    try:
+        ti = mt5.terminal_info()
+        if ti is None:
+            return False
+        if hasattr(ti, "connected") and not ti.connected:
+            return False
+        ai = mt5.account_info()
+        if ai is None:
+            return False
+        return True
+    except Exception as e:
+        log.warning("mt5_is_healthy probe error: %s", e)
+        return False
+
+
+def mt5_reconnect_if_needed() -> bool:
+    """v1.8: daemon that re-initializes MT5 with exponential backoff if the
+    terminal is unhealthy. Capped at 60s between attempts. Updates telemetry
+    counters for the heartbeat. Returns True if currently connected."""
+    global LAST_MT5_RECONNECT_AT, MT5_RECONNECT_COUNT
+    if mt5_is_healthy():
+        return True
+    log.warning("MT5 connection unhealthy — attempting reconnect…")
+    backoff = 2.0
+    for attempt in range(1, 6):  # ~ up to ~62s of attempts before bailing to watchdog
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        time.sleep(backoff)
+        if mt5_init():
+            MT5_RECONNECT_COUNT += 1
+            LAST_MT5_RECONNECT_AT = time.time()
+            log.info("MT5 reconnected on attempt %d (total reconnects this session: %d)",
+                     attempt, MT5_RECONNECT_COUNT)
+            return True
+        log.warning("MT5 reconnect attempt %d failed; backing off %.0fs", attempt, backoff)
+        backoff = min(backoff * 2, 30.0)
+    # Give up — let the watchdog (.bat loop) restart us cleanly.
+    log.error("MT5 reconnect exhausted retries. Exiting so watchdog can restart the process.")
+    return False
 
 
 # ----- broker symbol auto-detection -----
@@ -300,7 +371,28 @@ def positions_payload() -> List[Dict[str, Any]]:
 
 
 def poll_signals() -> List[Dict[str, Any]]:
-    body = {"account": account_payload(), "positions": positions_payload(), "version": BRIDGE_VERSION}
+    global LAST_SIGNAL_RECEIVED_AT
+    # v1.8 — enriched heartbeat: include terminal/account snapshot + telemetry counters
+    ti = None
+    try:
+        ti = mt5.terminal_info()
+    except Exception:
+        ti = None
+    body = {
+        "account": account_payload(),
+        "positions": positions_payload(),
+        "version": BRIDGE_VERSION,
+        "telemetry": {
+            "uptime_sec": int(time.time() - BRIDGE_START_TS),
+            "mt5_connected": bool(ti and getattr(ti, "connected", True)),
+            "last_candles_push_at": LAST_CANDLES_PUSH_AT or None,
+            "last_signal_received_at": LAST_SIGNAL_RECEIVED_AT or None,
+            "mt5_reconnects": MT5_RECONNECT_COUNT,
+            "last_mt5_reconnect_at": LAST_MT5_RECONNECT_AT or None,
+            "last_loop_error": LAST_LOOP_ERROR or None,
+            "streaming_pairs": [f"{p}:{tf}" for (p, tf) in STREAM_PAIRS],
+        },
+    }
     try:
         r = requests.post(f"{API_URL}/bridge-poll", headers=HEADERS, json=body, timeout=15)
         if r.status_code == 401:
@@ -312,7 +404,10 @@ def poll_signals() -> List[Dict[str, Any]]:
         if warn == "bridge_outdated":
             log.warning("OUTDATED BRIDGE · server requires >= %s · you are %s · %s",
                         data.get("min_version"), data.get("your_version"), data.get("message", ""))
-        return data.get("signals", [])
+        sigs = data.get("signals", [])
+        if sigs:
+            LAST_SIGNAL_RECEIVED_AT = time.time()
+        return sigs
     except Exception as e:
         log.warning("poll failed: %s", e)
         return []
@@ -713,7 +808,7 @@ _MT5_TF = {
 def push_candles() -> None:
     """v1.7: stream OHLC bars for the user's bot symbols to the server every CANDLES_PUSH_INTERVAL sec.
     Pair list is auto-refreshed from /api/bridge/stream-config (see refresh_stream_pairs)."""
-    global LAST_CANDLES_PUSH
+    global LAST_CANDLES_PUSH, LAST_CANDLES_PUSH_AT
     # v1.7: keep STREAM_PAIRS in sync with the user's active bots on every tick.
     refresh_stream_pairs()
     if time.time() - LAST_CANDLES_PUSH < CANDLES_PUSH_INTERVAL:
@@ -740,6 +835,7 @@ def push_candles() -> None:
                               headers=HEADERS,
                               json={"pair": base.upper(), "timeframe": tf.upper(), "rows": rows},
                               timeout=15)
+                LAST_CANDLES_PUSH_AT = time.time()
             except Exception as e:
                 log.warning("push_candles POST failed for %s/%s: %s", base, tf, e)
         except Exception as e:
@@ -864,8 +960,9 @@ signal.signal(signal.SIGTERM, _stop)
 
 
 def main():
-    log.info("Aurum FX bridge v%s starting · API %s", BRIDGE_VERSION, API_URL)
+    log.info("Aurum FX bridge v%s starting · API %s · log %s", BRIDGE_VERSION, API_URL, LOG_FILE)
     if not mt5_init():
+        log.error("Initial MT5 connect failed — exiting (watchdog will retry).")
         sys.exit(1)
 
     build_symbol_map()
@@ -880,9 +977,18 @@ def main():
              "ON" if PROFIT_LOCK_ENABLED else "OFF", PROFIT_LOCK_DRAWDOWN_PERCENT, PROFIT_LOCK_MIN_PROFIT,
              "ON" if PARTIAL_CLOSE_ENABLED else "OFF", PARTIAL_CLOSE_FRACTION * 100.0)
 
+    global LAST_LOOP_ERROR
+    health_check_every = 30  # seconds
+    last_health_check = 0.0
     while _running:
         try:
-            push_candles()                 # v1.6: stream OHLC bars to server
+            # v1.8: MT5 health probe every 30s. If unhealthy, run reconnect daemon.
+            if time.time() - last_health_check > health_check_every:
+                last_health_check = time.time()
+                if not mt5_is_healthy():
+                    if not mt5_reconnect_if_needed():
+                        sys.exit(3)  # watchdog will restart cleanly
+            push_candles()                 # v1.7: stream OHLC bars to server
             signals = poll_signals()
             for s in signals:
                 # Carry over max_hold_minutes from the signal so we can enforce it post-fill
@@ -893,13 +999,20 @@ def main():
             _force_close_expired()         # v1.6: close scalps past their TTL
             manage_open_positions()
             reconcile_closed()
+            LAST_LOOP_ERROR = ""
+        except SystemExit:
+            raise
         except Exception as e:
+            LAST_LOOP_ERROR = f"{type(e).__name__}: {str(e)[:200]}"
             log.exception("loop error: %s", e)
         for _ in range(int(POLL_INTERVAL * 10)):
             if not _running:
                 break
             time.sleep(0.1)
-    mt5.shutdown()
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
     log.info("Bye.")
 
 

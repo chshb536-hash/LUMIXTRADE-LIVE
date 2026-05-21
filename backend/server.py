@@ -36,7 +36,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from engine import Candle, StrategyConfig, generate_signal, calc_lot, ema, atr, detect_regime
 from marketdata import fetch_candles, fetch_price, store_candles, init_db as _md_init
 from data_validation import validate_candles
-from strategy_v2 import generate_signal_v2, StrategyV2Config
+from strategy_v2 import generate_signal_v2, StrategyV2Config, conservative_config
 from risk_engine import adaptive_lot, volatility_gate, bridge_health
 import notifications as notify_svc
 
@@ -55,7 +55,7 @@ ACCESS_TOKEN_MINUTES = 60 * 24 * 7  # 7 days (matches UX of Supabase persistSess
 REFRESH_TOKEN_DAYS = 30
 # Minimum bridge version that's allowed to receive signals. Older bridges still get a
 # 200 OK heartbeat so they don't crash, but receive zero signals + a `warning` field.
-MIN_BRIDGE_VERSION = "1.7"
+MIN_BRIDGE_VERSION = "1.8"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@aurumfx.com")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Mohyuddin@123")
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
@@ -78,7 +78,13 @@ _md_init(db)
 
 # Strategy v2 toggle. Default ON — set STRATEGY_VERSION=v1 in .env to fall back.
 STRATEGY_VERSION = os.environ.get("STRATEGY_VERSION", "v2").lower()
-STRATEGY_V2_CFG = StrategyV2Config()
+# v1.8 — Conservative live-forward preset. Default ON. Set STRATEGY_CONSERVATIVE=false
+# in backend/.env when you want full A/B/C signal volume back.
+_CONSERVATIVE = os.environ.get("STRATEGY_CONSERVATIVE", "true").lower() in ("1", "true", "yes", "on")
+STRATEGY_V2_CFG = conservative_config() if _CONSERVATIVE else StrategyV2Config()
+log.info("strategy_v2 config: conservative=%s · min_confidence=%.2f · require_displacement=%s · require_htf=%s",
+         _CONSERVATIVE, STRATEGY_V2_CFG.min_confidence,
+         STRATEGY_V2_CFG.require_displacement, STRATEGY_V2_CFG.require_htf_alignment)
 
 
 # ---------- helpers: password, jwt, time ----------
@@ -2397,6 +2403,192 @@ async def diag_candles(
         "gap_count_2x": gap2, "gap_count_5x": gap5,
         "tf_ms": tf_ms,
     }
+
+
+@api.get("/diag/bot/{bot_id}")
+async def diag_bot(bot_id: str, user: dict = Depends(get_current_user)):
+    """v1.8 — Full diagnostic snapshot for a single bot.
+    Returns: bot config, last_scan_at, last_scan_result, candle freshness, bridge heartbeat age,
+    open trade count, signals_last_24h.
+    """
+    bot = await db.bots.find_one({"_id": bot_id})
+    if not bot:
+        raise HTTPException(404, "Bot not found")
+    if bot["user_id"] != user["_id"] and user.get("role") != "admin":
+        raise HTTPException(403, "Forbidden")
+    pair = (bot.get("pair") or "").upper()
+    tf = (bot.get("timeframe") or "").upper()
+    tf_ms_map = {"M1": 60_000, "M5": 300_000, "M15": 900_000, "M30": 1_800_000,
+                 "H1": 3_600_000, "H4": 14_400_000, "D1": 86_400_000}
+    tf_ms = tf_ms_map.get(tf, 900_000)
+    candle_count = await db.candles.count_documents({"pair": pair, "timeframe": tf})
+    last_candle = await db.candles.find_one(
+        {"pair": pair, "timeframe": tf}, {"_id": 0, "t": 1, "c": 1},
+        sort=[("t", -1)],
+    )
+    now_ms = int(now_utc().timestamp() * 1000)
+    last_candle_age_min = (now_ms - int(last_candle["t"])) / 60_000 if last_candle else None
+    candle_health = "ok"
+    if not last_candle:
+        candle_health = "no_data"
+    elif candle_count < 80:
+        candle_health = "insufficient"
+    elif last_candle_age_min is not None and last_candle_age_min > (tf_ms / 60_000) * 3:
+        candle_health = "stale"
+    bk = await db.bridge_keys.find_one(
+        {"user_id": bot["user_id"], "revoked": False},
+        {"_id": 0, "last_seen_at": 1, "bridge_version": 1, "label": 1},
+        sort=[("last_seen_at", -1)],
+    )
+    bridge_age_min = None
+    if bk and bk.get("last_seen_at"):
+        try:
+            t = datetime.fromisoformat(bk["last_seen_at"].replace("Z", "+00:00"))
+            bridge_age_min = (now_utc() - t).total_seconds() / 60
+        except Exception:
+            pass
+    open_n = await db.trades.count_documents(
+        {"user_id": bot["user_id"], "bot_id": bot_id, "status": "open"},
+    )
+    closed_n = await db.trades.count_documents(
+        {"user_id": bot["user_id"], "bot_id": bot_id, "status": "closed"},
+    )
+    recent_signals = await db.signals.count_documents(
+        {"bot_id": bot_id, "created_at": {"$gte": (now_utc() - timedelta(hours=24)).isoformat()}},
+    )
+    return {
+        "bot_id": bot_id,
+        "name": bot.get("name"),
+        "pair": pair, "timeframe": tf,
+        "is_active": bool(bot.get("is_active")),
+        "higher_tf_confirmation": bot.get("higher_tf_confirmation"),
+        "last_scan_at": bot.get("last_scan_at"),
+        "last_scan_result": bot.get("last_scan_result"),
+        "candle_count": candle_count,
+        "last_candle_t": last_candle["t"] if last_candle else None,
+        "last_candle_age_min": round(last_candle_age_min, 2) if last_candle_age_min is not None else None,
+        "candle_health": candle_health,
+        "bridge_version": (bk or {}).get("bridge_version"),
+        "bridge_last_seen_at": (bk or {}).get("last_seen_at"),
+        "bridge_age_min": round(bridge_age_min, 2) if bridge_age_min is not None else None,
+        "open_trades": open_n,
+        "closed_trades": closed_n,
+        "signals_last_24h": recent_signals,
+    }
+
+
+@api.get("/admin/system-health")
+async def admin_system_health(admin: dict = Depends(get_current_admin)):
+    """v1.8 — Aggregated health snapshot. Suitable for 10s polling from a dashboard."""
+    now_ms = int(now_utc().timestamp() * 1000)
+    bridge_keys = await db.bridge_keys.find(
+        {"revoked": False},
+        {"_id": 0, "user_id": 1, "last_seen_at": 1, "bridge_version": 1, "label": 1},
+    ).to_list(500)
+    bridges_online = 0
+    for k in bridge_keys:
+        ls = k.get("last_seen_at")
+        if not ls:
+            continue
+        try:
+            t = datetime.fromisoformat(ls.replace("Z", "+00:00"))
+            if (now_utc() - t).total_seconds() < 300:
+                bridges_online += 1
+        except Exception:
+            continue
+    pair_tf_index: Dict[str, Any] = {}
+    async for row in db.candles.aggregate([
+        {"$group": {
+            "_id": {"pair": "$pair", "tf": "$timeframe"},
+            "count": {"$sum": 1},
+            "last_t": {"$max": "$t"},
+        }},
+        {"$sort": {"_id": 1}},
+    ]):
+        k = f"{row['_id']['pair']}:{row['_id']['tf']}"
+        pair_tf_index[k] = {
+            "count": int(row["count"]),
+            "last_t": int(row["last_t"]),
+            "last_age_min": round((now_ms - int(row["last_t"])) / 60_000, 2),
+        }
+    bots_total = await db.bots.count_documents({})
+    bots_active = await db.bots.count_documents({"is_active": True})
+    signals_24h = await db.signals.count_documents(
+        {"created_at": {"$gte": (now_utc() - timedelta(hours=24)).isoformat()}},
+    )
+    trades_open = await db.trades.count_documents({"status": "open"})
+    trades_24h = await db.trades.count_documents(
+        {"opened_at": {"$gte": (now_utc() - timedelta(hours=24)).isoformat()}},
+    )
+    recent_reasons: Dict[str, int] = {}
+    async for b in db.bots.find(
+        {"last_scan_result": {"$exists": True}},
+        {"_id": 0, "last_scan_result": 1},
+    ).limit(200):
+        rsn = (b.get("last_scan_result") or "").split(":")[0]
+        recent_reasons[rsn] = recent_reasons.get(rsn, 0) + 1
+    scans_recent = await db.bots.count_documents({
+        "last_scan_at": {"$gte": (now_utc() - timedelta(minutes=10)).isoformat()},
+    })
+    return {
+        "ts": now_iso(),
+        "min_bridge_version": MIN_BRIDGE_VERSION,
+        "strategy": {
+            "version": STRATEGY_VERSION,
+            "conservative": _CONSERVATIVE,
+            "min_confidence": STRATEGY_V2_CFG.min_confidence,
+        },
+        "bridges": {"total": len(bridge_keys), "online_5min": bridges_online},
+        "candles": pair_tf_index,
+        "bots": {"total": bots_total, "active": bots_active,
+                 "scans_in_last_10_min": scans_recent},
+        "signals_24h": signals_24h,
+        "trades": {"open": trades_open, "opened_24h": trades_24h},
+        "recent_scan_reasons": recent_reasons,
+    }
+
+
+@api.get("/admin/trade-postmortem/{trade_id}")
+async def admin_trade_postmortem(trade_id: str, admin: dict = Depends(get_current_admin)):
+    """v1.8 — Full postmortem for a single trade. Joins trade + signal + bot + v2_context."""
+    tr = await db.trades.find_one({"_id": trade_id})
+    if not tr:
+        raise HTTPException(404, "Trade not found")
+    sig = None
+    if tr.get("signal_id"):
+        sig = await db.signals.find_one({"_id": tr["signal_id"]}, {"_id": 0})
+    bot = None
+    if tr.get("bot_id"):
+        bot = await db.bots.find_one(
+            {"_id": tr["bot_id"]},
+            {"_id": 0, "name": 1, "pair": 1, "timeframe": 1, "higher_tf_confirmation": 1},
+        )
+    verdict_flags: List[str] = []
+    pnl = tr.get("pnl")
+    if pnl is not None and float(pnl) < 0:
+        verdict_flags.append("losing_trade")
+        sl_p = tr.get("slippage_pips") or 0
+        sp = tr.get("spread_at_fill") or 0
+        if sl_p > 5:
+            verdict_flags.append(f"high_slippage:{sl_p:.1f}p")
+        if sp > 0.0003:
+            verdict_flags.append(f"wide_spread:{sp:.5f}")
+        if tr.get("confidence") is not None and float(tr["confidence"]) < 0.65:
+            verdict_flags.append(f"low_confidence:{float(tr['confidence']):.2f}")
+        v2c = (sig or {}).get("v2_context") or {}
+        if v2c.get("htf_aligned") is False:
+            verdict_flags.append("contra_htf")
+        if v2c.get("displacement") is None:
+            verdict_flags.append("no_displacement")
+        if tr.get("exit_reason") == "sl_hit":
+            verdict_flags.append("sl_hit")
+    return {
+        "trade": _strip_id(tr),
+        "signal": sig,
+        "bot": bot,
+        "verdict_flags": verdict_flags,
+    }
+
 
 
 # ---------- Notifications ----------

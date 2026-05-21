@@ -83,3 +83,37 @@ Verified on preview:
 - Validation unit test: 2-bar M15 hole → `ok=True soft_gaps=1` (previously `ok=False missing_candles`). 6-bar hole → `ok=False missing_candles` (correctly still blocked).
 
 Production status: code is in preview only — user must hit **Deploy** to push to `auto-scan-bot.emergent.host` / `lumixtrade.live`.
+
+**2026-05-21 — Bridge v1.8 + production hardening pass shipped (preview)**
+
+Triggered by: production reported `data_unavailable`, zero auto-signals for 18h, and 5–7 manual-scan signals all losing. Bridge still on v1.6 on FXSVPS while server runs v1.7 → all v1.6 polls returned `signals=[]` with `bridge_outdated`.
+
+Changes:
+- `MIN_BRIDGE_VERSION` bumped 1.7 → 1.8 (`server.py`).
+- **`strategy_v2.py`** — new `conservative_config()` preset. New `StrategyV2Config` fields: `require_displacement`, `require_fvg_for_bos`, `require_htf_alignment`, `max_atr_ratio`, `min_displacement_body_atr`. Enforced in `_setup_bos_retest`. `_displacement()` now accepts `body_mult` parameter.
+- **`server.py`** — new env flag `STRATEGY_CONSERVATIVE` (default `true`). Selects between full v2 config and `conservative_config()`. Logged at startup.
+- **New endpoints**:
+  - `GET /api/diag/bot/{bot_id}` — full diagnostic snapshot: candle freshness, bridge heartbeat age, scan history, open/closed trade count, signals in last 24h, candle_health verdict (`ok`/`stale`/`insufficient`/`no_data`).
+  - `GET /api/admin/system-health` — single aggregated snapshot for dashboard polling: bridges online_5min, candle counts per (pair, tf), bot scans in last 10 min, signals_24h, trades open/24h, recent scan-reason histogram, strategy config.
+  - `GET /api/admin/trade-postmortem/{trade_id}` — joins trade + signal + bot + v2_context. Computes `verdict_flags`: `losing_trade`, `high_slippage:Xp`, `wide_spread:X`, `low_confidence:X`, `contra_htf`, `no_displacement`, `sl_hit`.
+- **Bridge v1.8** (`backend/static/aurum_bridge.py` + synced to `frontend/public/`):
+  - Rotating file log to `<bridge_dir>/logs/aurum_bridge.log` (10 MB × 5).
+  - `mt5_is_healthy()` probe + `mt5_reconnect_if_needed()` daemon — exponential backoff 2s→30s, up to 5 attempts before exiting with code 3 for watchdog restart.
+  - Health probe runs every 30s in the main loop.
+  - Heartbeat enriched with `telemetry`: `uptime_sec`, `mt5_connected`, `last_candles_push_at`, `last_signal_received_at`, `mt5_reconnects`, `last_mt5_reconnect_at`, `last_loop_error`, `streaming_pairs`.
+  - Distinct exit codes: 0=clean, 1=initial MT5 fail, 2=config error (no restart), 3=reconnect exhausted.
+- **`run_aurum_bridge.bat`** — Windows watchdog wrapper. Restarts the bridge on crash with code-aware backoff. Exits cleanly on 0/2 (config error), retries on 1/3/other.
+
+Verified on preview:
+- `GET /api/health` → version `1.8` ✅
+- `GET /api/admin/system-health` returns full payload incl. strategy={conservative:true, min_confidence:0.7} ✅
+- `GET /api/diag/bot/{id}` returns candle_health=`no_data`, bridge_age_min, etc ✅
+- `GET /api/admin/trade-postmortem/{id}` on seeded losing trade returns 7 verdict flags including `contra_htf`, `no_displacement`, `sl_hit`, `high_slippage:6.2p`, `wide_spread:0.00045`, `low_confidence:0.58` ✅
+- Backend startup log confirms `strategy_v2 config: conservative=True · min_confidence=0.70 · require_displacement=True · require_htf=True` ✅
+
+Production status: code in preview only — user must hit **Deploy** to push to `lumixtrade.live`. After deploy, user must replace VPS bridge with v1.8 (download from `lumixtrade.live/aurum_bridge.py` + `run_aurum_bridge.bat`).
+
+Deferred to next iteration (explicitly):
+- Full React "Live Analytics Dashboard" UI consuming the new endpoints.
+- Telegram `no_candles_for_X_min` and `no_scan_for_X_min` alerters (needs `TELEGRAM_BOT_TOKEN` env var first).
+- Per-trade postmortem write-up of the user's actual production losing trades (requires sharing `/api/admin/trade-postmortem/{id}` JSON from production).
