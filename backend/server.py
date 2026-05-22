@@ -55,7 +55,7 @@ ACCESS_TOKEN_MINUTES = 60 * 24 * 7  # 7 days (matches UX of Supabase persistSess
 REFRESH_TOKEN_DAYS = 30
 # Minimum bridge version that's allowed to receive signals. Older bridges still get a
 # 200 OK heartbeat so they don't crash, but receive zero signals + a `warning` field.
-MIN_BRIDGE_VERSION = "1.8"
+MIN_BRIDGE_VERSION = "1.8.1"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@aurumfx.com")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Mohyuddin@123")
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
@@ -1054,6 +1054,9 @@ async def bridge_report(request: Request):
         # Best-effort exit-reason classification.
         exit_price = float(body["exit_price"]) if body.get("exit_price") is not None else None
         exit_reason = body.get("reason") or None
+        # Phase-1: trust explicit force-close reasons from the bridge (max_hold, profit_lock,
+        # manager_close, trail). Only fall back to SL/TP-distance heuristic when no reason was sent.
+        _force_reasons = {"max_hold", "profit_lock", "manager_close", "trail"}
         if not exit_reason and exit_price is not None:
             isl = tr.get("initial_sl")
             itp = tr.get("initial_tp")
@@ -2118,15 +2121,19 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                             {"symbol": r["symbol"], "ts": r["ts"]},
                             {"$set": r}, upsert=True,
                         )
-            # Skip if recent pending signal exists (<3 min) — gives us 1 signal per scheduled scan
-            since = (now_utc() - timedelta(minutes=3)).isoformat()
+            # Phase-1: per-bot signal cooldown = 1 closed bar of the bot's timeframe.
+            # Prevents the scheduler (3-min ticks) from re-firing the same setup
+            # multiple times inside the SAME candle (root cause of duplicate-signal losses).
+            tf_min_map = {"M1": 1, "M5": 5, "M15": 15, "M30": 30, "H1": 60, "H4": 240, "D1": 1440}
+            cooldown_min = tf_min_map.get((bot.get("timeframe") or "M15").upper(), 15)
+            since = (now_utc() - timedelta(minutes=cooldown_min)).isoformat()
             recent = await db.signals.find_one(
                 {"bot_id": bot["_id"], "created_at": {"$gte": since}},
             )
             if recent:
                 await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
                     "last_scan_at": now_iso(),
-                    "last_scan_result": "cooldown",
+                    "last_scan_result": f"cooldown:{cooldown_min}min",
                 }})
                 continue
             # Route to strategy engine (v2 by default)

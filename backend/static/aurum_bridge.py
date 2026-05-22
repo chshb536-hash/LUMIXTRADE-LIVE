@@ -62,7 +62,7 @@ except ImportError:
 import requests
 
 # ----- config -----
-BRIDGE_VERSION = "1.8"
+BRIDGE_VERSION = "1.8.1"
 API_KEY  = os.environ.get("AURUM_API_KEY")
 API_URL  = (os.environ.get("AURUM_API_URL") or "").rstrip("/")
 MT5_LOGIN    = os.environ.get("MT5_LOGIN")
@@ -203,6 +203,11 @@ CLOSING_TICKETS: set = set()                 # tickets we just sent a close for 
 INITIAL_RISK_USD: Dict[int, float] = {}      # ticket -> 1R in USD computed at open
 INITIAL_OPEN_PRICE: Dict[int, float] = {}    # ticket -> open price
 PARTIAL_DONE: set = set()                    # tickets that have had their +1R partial close
+# Phase-1 (v1.8.1) state
+BE_DONE: set = set()                         # tickets that have had their +0.5R BE SL move
+CLOSE_REASONS: Dict[int, str] = {}            # ticket -> reason string (max_hold, profit_lock, trail, manual)
+# Phase-1: default max_hold for legacy tickets observed at startup
+DEFAULT_MAX_HOLD_MIN = int(os.environ.get("AURUM_DEFAULT_MAX_HOLD_MIN", "480"))
 
 
 def mt5_init() -> bool:
@@ -658,6 +663,8 @@ def _close_position(pos, reason: str) -> bool:
         "type_time": mt5.ORDER_TIME_GTC,
     }
     CLOSING_TICKETS.add(int(pos.ticket))
+    # v1.8.1: remember the *real* close reason so reconcile_closed() can ship it to the server.
+    CLOSE_REASONS[int(pos.ticket)] = reason
     for mode in FILLING_MODES:
         req = dict(base, type_filling=mode)
         res = mt5.order_send(req)
@@ -768,18 +775,20 @@ def _move_sl_to_breakeven(pos, open_price: float) -> bool:
 
 
 def _force_close_expired() -> None:
-    """v1.6: close positions whose max_hold_minutes has elapsed since fill (scalp setups)."""
-    if not TICKET_MAX_HOLD:
-        return
+    """v1.6: close positions whose max_hold_minutes has elapsed since fill (scalp setups).
+    Phase-1 (v1.8.1): also handles legacy tickets (no per-ticket max_hold cached) using
+    DEFAULT_MAX_HOLD_MIN. No more 13.5h XAU bleed trades after bridge restarts."""
     now = time.time()
     for pos in (mt5.positions_get() or []):
         try:
             if int(pos.magic) != 990077:
                 continue
             t = int(pos.ticket)
+            # Hydrate fallback values for legacy tickets that the bridge inherited.
             mhm = TICKET_MAX_HOLD.get(t)
             if not mhm:
-                continue
+                mhm = DEFAULT_MAX_HOLD_MIN
+                TICKET_MAX_HOLD[t] = mhm
             opened = OPEN_TICKET_OPENED_AT.get(t)
             if opened is None:
                 # Wasn't opened during this bridge session — use MT5's open time
@@ -861,6 +870,24 @@ def manage_open_positions() -> None:
                 peak = current
                 PEAK_PROFITS[ticket] = peak
 
+            # 0a) Phase-1 (v1.8.1): MOVE-SL-TO-BREAKEVEN at +0.5R (BEFORE 1R partial).
+            # Reason: live-forward data showed many trades reaching ~50% to TP, then
+            # reversing all the way to SL for a full loss (e.g. XAG +$5.75 MFE → -$8.35).
+            # Moving SL to entry at half-R eliminates that class of loss entirely.
+            if ticket not in BE_DONE:
+                if ticket not in INITIAL_RISK_USD:
+                    r = _compute_initial_1r_usd(pos)
+                    if r and r > 0:
+                        INITIAL_RISK_USD[ticket] = r
+                        INITIAL_OPEN_PRICE[ticket] = float(pos.price_open)
+                risk_usd = INITIAL_RISK_USD.get(ticket)
+                if risk_usd and current >= risk_usd * 0.5:
+                    if _move_sl_to_breakeven(pos, INITIAL_OPEN_PRICE[ticket]):
+                        BE_DONE.add(ticket)
+                        log.info("BE-MOVE ticket %s · profit $%.2f reached 0.5R ($%.2f) — SL → entry",
+                                 ticket, current, risk_usd * 0.5)
+                    # Don't continue — let the same cycle also evaluate trailing/partial.
+
             # 0) Partial close at +1R (one-shot per ticket). Compute initial 1R once,
             # then close FRACTION of volume and move SL to break-even on the remainder.
             if PARTIAL_CLOSE_ENABLED and ticket not in PARTIAL_DONE:
@@ -930,14 +957,28 @@ def reconcile_closed() -> None:
         commission = sum(d.commission for d in deals)
         swap = sum(d.swap for d in deals)
         exit_deal = max(deals, key=lambda d: d.time)
-        report("close", {
+        # Phase-1: surface the true close reason (max_hold / profit_lock / trail / manual)
+        # so the server stops mis-classifying force-closes as sl_hit.
+        reason = CLOSE_REASONS.pop(t, None)
+        if reason and reason.startswith("max_hold"):
+            close_reason = "max_hold"
+        elif reason and "drawdown" in reason:
+            close_reason = "profit_lock"
+        elif reason:
+            close_reason = "manager_close"
+        else:
+            close_reason = None  # let server's SL/TP-distance heuristic decide for organic closes
+        payload = {
             "ticket": t,
             "exit_price": exit_deal.price,
             "pnl": pnl,
             "commission": commission,
             "swap": swap,
-        })
-        log.info("CLOSE ticket %s · pnl %.2f", t, pnl)
+        }
+        if close_reason:
+            payload["reason"] = close_reason
+        report("close", payload)
+        log.info("CLOSE ticket %s · pnl %.2f · reason=%s", t, pnl, close_reason or "organic")
         TRACKED_TICKETS.pop(t, None)
         # Clean up trade-management state for closed tickets
         PEAK_PROFITS.pop(t, None)
@@ -946,6 +987,7 @@ def reconcile_closed() -> None:
         INITIAL_RISK_USD.pop(t, None)
         INITIAL_OPEN_PRICE.pop(t, None)
         PARTIAL_DONE.discard(t)
+        BE_DONE.discard(t)
         TICKET_MAX_HOLD.pop(t, None)
         OPEN_TICKET_OPENED_AT.pop(t, None)
 
@@ -968,10 +1010,21 @@ def main():
     build_symbol_map()
 
     # Pre-load existing AurumFX positions so we can report their closes
+    # Phase-1 (v1.8.1): also hydrate OPEN_TICKET_OPENED_AT + TICKET_MAX_HOLD from each open
+    # position's broker-side fields. This fixes the bug where bridge restarts caused legacy
+    # tickets to never get force-closed by max_hold (was: held a XAU trade for 13.5h instead of 8h).
     for p in (mt5.positions_get() or []):
         if p.magic == 990077:
             TRACKED_TICKETS[p.ticket] = ""
-    log.info("Tracking %d existing position(s)", len(TRACKED_TICKETS))
+            # MT5 position `time` field = unix seconds the position was opened.
+            opened_at = float(getattr(p, "time", 0) or 0)
+            if opened_at > 0:
+                OPEN_TICKET_OPENED_AT[p.ticket] = opened_at
+            # Without the original signal, use the configurable default (AURUM_DEFAULT_MAX_HOLD_MIN=480).
+            # If you want different per-pair defaults, set them after this loop.
+            TICKET_MAX_HOLD[p.ticket] = DEFAULT_MAX_HOLD_MIN
+    log.info("Tracking %d existing position(s) · hydrated max_hold=%d min from env",
+             len(TRACKED_TICKETS), DEFAULT_MAX_HOLD_MIN)
     log.info("Trade management · trailing=%s start=$%.2f distance=$%.2f · profit-lock=%s drawdown=%.0f%% min=$%.2f · partial-1R=%s frac=%.0f%%",
              "ON" if TRAILING_ENABLED else "OFF", TRAILING_START_PROFIT, TRAILING_DISTANCE,
              "ON" if PROFIT_LOCK_ENABLED else "OFF", PROFIT_LOCK_DRAWDOWN_PERCENT, PROFIT_LOCK_MIN_PROFIT,

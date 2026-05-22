@@ -195,26 +195,34 @@ class StrategyV2Config:
     require_htf_alignment: bool = False       # drop signals that disagree with higher-TF trend
     max_atr_ratio: float = 1.8                # reject when current ATR > X × 50-bar median
     min_displacement_body_atr: float = 1.4    # body-size requirement for "displacement" bars
+    disable_liquidity_sweep: bool = False     # Phase-1: hard-disable sweep-reversal setup
+    bar_close_only: bool = False              # Phase-1: scanner only acts on closed bars
 
 
 def conservative_config() -> "StrategyV2Config":
     """Returns a stricter config preset for the live-forward stabilisation phase.
     Activated when STRATEGY_CONSERVATIVE=true is set in backend/.env (default ON).
+    Phase-1 tuning (2026-05-22) — based on real production losing-trade analysis:
+      - min_confidence 0.70 → 0.78 (all 3 analysed losers were 0.71–0.74; barely passed)
+      - require_displacement on BOS, plus a new disable_liquidity_sweep flag
+        (sweep setups were 2/3 of analysed losers, all contra-HTF)
     """
     return StrategyV2Config(
         sl_atr=1.5,
         tp_atr=3.0,
-        min_confidence=0.70,           # was 0.55 — only A+ setups
+        min_confidence=0.78,           # Phase-1: was 0.70; analysed losers were 0.71–0.74
         scalp_sl_atr=1.0,
-        scalp_tp_atr=2.0,              # widened from 1.5 (better RR profile)
-        scalp_min_confidence=0.70,
-        max_hold_minutes_scalp=30,
+        scalp_tp_atr=2.0,
+        scalp_min_confidence=0.78,     # Phase-1: was 0.70
+        max_hold_minutes_scalp=45,     # Phase-1: was 30 — give the trade 1 ATR of room first
         max_hold_minutes_swing=360,
         require_displacement=True,
         require_fvg_for_bos=True,
-        require_htf_alignment=True,
+        require_htf_alignment=True,    # Phase-1: also enforced inside _setup_liquidity_reversal
         max_atr_ratio=1.5,
-        min_displacement_body_atr=1.7,  # stronger institutional bars only
+        min_displacement_body_atr=1.7,
+        disable_liquidity_sweep=True,  # Phase-1: hard-disable the sweep-reversal setup
+        bar_close_only=True,           # Phase-1: scanner only on closed bars (set in scanner)
     )
 
 
@@ -442,9 +450,21 @@ def _setup_range_breakout(candles, cfg: StrategyV2Config, ef, es, r, a,
 def _setup_liquidity_reversal(candles, cfg: StrategyV2Config, ef, es, r, a,
                               regime: Regime, session: Session,
                               sweep, htf_trend, ctx: SignalContext):
+    # Phase-1: this setup is the worst-performing in live-forward (2/3 analysed losers).
+    # When disable_liquidity_sweep is True, never fire.
+    if cfg.disable_liquidity_sweep:
+        return None
     if sweep is None:
         return None
     side: Side = sweep
+    # Phase-1: enforce HTF alignment on sweep reversals too (was BOS-only before).
+    htf_aligned: Optional[bool] = None
+    if htf_trend and htf_trend != "flat":
+        want = "up" if side == "buy" else "down"
+        htf_aligned = (htf_trend == want)
+        if cfg.require_htf_alignment and not htf_aligned:
+            return None
+    ctx.htf_aligned = htf_aligned
     last = candles[-1]
     atr_v = a[-1]
     if atr_v <= 0:
@@ -462,10 +482,12 @@ def _setup_liquidity_reversal(candles, cfg: StrategyV2Config, ef, es, r, a,
     sweep_s = 0.15
     rsi_s = 0.07 if (side == "buy" and r[-1] < 32) or (side == "sell" and r[-1] > 68) else 0.03
     session_s = 0.03 if session in ("london", "new_york", "overlap") else -0.04
-    conf = max(0.0, min(0.99, base + sweep_s + rsi_s + session_s))
+    htf_s = 0.05 if htf_aligned else (-0.05 if htf_aligned is False else 0.0)
+    conf = max(0.0, min(0.99, base + sweep_s + rsi_s + session_s + htf_s))
     if conf < cfg.scalp_min_confidence:
         return None
-    ctx.scores = {"base": base, "sweep": sweep_s, "rsi": rsi_s, "session": session_s}
+    ctx.scores = {"base": base, "sweep": sweep_s, "rsi": rsi_s,
+                  "session": session_s, "htf": htf_s}
     reason = f"Liquidity sweep {side.upper()} · RSI {r[-1]:.1f}"
     sig = GeneratedSignal(
         side=side, entry=entry, sl=sl, tp=tp, confidence=conf,

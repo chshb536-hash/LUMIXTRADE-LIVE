@@ -117,3 +117,47 @@ Deferred to next iteration (explicitly):
 - Full React "Live Analytics Dashboard" UI consuming the new endpoints.
 - Telegram `no_candles_for_X_min` and `no_scan_for_X_min` alerters (needs `TELEGRAM_BOT_TOKEN` env var first).
 - Per-trade postmortem write-up of the user's actual production losing trades (requires sharing `/api/admin/trade-postmortem/{id}` JSON from production).
+
+**2026-05-22 — Phase-1 stabilisation pass shipped (preview)**
+
+Trigger: user shared 3 production trade-postmortem JSONs. Analysis revealed:
+- All 3 losers had confidence 0.71–0.74 — just clearing the 0.70 floor.
+- 2/3 were liquidity-sweep ranging setups, both contra-HTF (HTF-alignment was not enforced in `_setup_liquidity_reversal` — only `_setup_bos_retest`).
+- 1/3 was an XAU buy held 13h 35m past the `max_hold_minutes_swing=480` cap → bridge dropped `TICKET_MAX_HOLD` state after restart.
+- 1/3 was a max_hold force-close mis-tagged `exit_reason="sl_hit"` because bridge didn't propagate `reason="max_hold"` to server.
+
+Changes:
+- **`strategy_v2.py`**:
+  - `conservative_config().min_confidence` 0.70 → **0.78**.
+  - `conservative_config().max_hold_minutes_scalp` 30 → **45** (gives in-progress trades 1 ATR of room).
+  - New `disable_liquidity_sweep` field — `_setup_liquidity_reversal` returns `None` when True. Default ON in conservative.
+  - `_setup_liquidity_reversal` now also enforces `require_htf_alignment` (blocks Trade-#2-style contra-HTF sweeps).
+- **`server.py`**:
+  - `MIN_BRIDGE_VERSION` bumped 1.8 → **1.8.1**.
+  - Per-bot signal cooldown is now **timeframe-aware**: M1→1min, M5→5min, M15→15min, M30→30min, H1→60min, etc. Was hardcoded 3 min, which let the 3-min scheduler re-fire the same setup multiple times inside one M15 bar (the root cause of duplicate-signal losses in the screenshot).
+  - `bridge_report` close-event now respects bridge-supplied `reason` for known force-close codes (`max_hold`, `profit_lock`, `manager_close`, `trail`) — only falls back to SL/TP-distance heuristic for organic SL/TP fills.
+- **`aurum_bridge.py` v1.8.1**:
+  - On startup, hydrate `OPEN_TICKET_OPENED_AT` from `pos.time` and `TICKET_MAX_HOLD` from new env `AURUM_DEFAULT_MAX_HOLD_MIN` (default 480 min) for **every existing magic-990077 position**. Legacy tickets now get force-closed correctly after bridge restart.
+  - `_force_close_expired()` no longer bails early on empty `TICKET_MAX_HOLD` dict — uses `DEFAULT_MAX_HOLD_MIN` as fallback.
+  - New `CLOSE_REASONS: Dict[int, str]` cache: `_close_position(pos, reason)` stores reason, `reconcile_closed()` reads it and ships normalised `reason` field (`max_hold`/`profit_lock`/`manager_close`) in the close report.
+  - New **MOVE-SL-TO-BREAKEVEN at +0.5R** (one-shot per ticket, `BE_DONE` set). Eliminates the "MFE +$5.75 → SL hit −$8.35" pattern observed on the XAG trade. Triggers BEFORE the 1R partial close logic.
+
+Verified on preview:
+- Backend startup log: `strategy_v2 config: conservative=True · min_confidence=0.78 · require_displacement=True · require_htf=True` ✅
+- Unit test: `_setup_liquidity_reversal` returns None when `disable_liquidity_sweep=True` ✅
+- Unit test: contra-HTF sweep blocked when `require_htf_alignment=True` (would have prevented Trade #2 loss) ✅
+- Integration test: `POST /api/bridge-report {reason:"max_hold"}` → trade.exit_reason = "max_hold" (NOT mis-tagged sl_hit) ✅
+- Integration test: M5 bot cooldown reports `"cooldown:5min"`; M15 bot reports `"cooldown:15min"` ✅
+
+Production status: code in preview only — user must hit **Deploy** and replace VPS bridge with v1.8.1.
+
+Defer to Phase-2:
+- Correlation cap on USD-cluster (max 2 concurrent USD-correlated trades across XAU+EUR+GBP+AUD)
+- Bar-close-only scanner (only evaluate setups on freshly-closed bars)
+- EURUSD TP-floor fix (enforce TP-distance ≥ 2× SL-distance regardless of ATR)
+- Lot-cap during drawdown (halve base lot when weekly DD > 10%)
+- React Live Analytics Dashboard
+
+Defer to Phase-3:
+- Narrow bots to XAU-only + BOS-retest-only for 50-trade edge validation
+- Per-pair session-window restriction (London/NY open only)
