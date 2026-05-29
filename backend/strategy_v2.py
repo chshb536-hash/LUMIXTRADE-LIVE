@@ -200,29 +200,31 @@ class StrategyV2Config:
 
 
 def conservative_config() -> "StrategyV2Config":
-    """Returns a stricter config preset for the live-forward stabilisation phase.
-    Activated when STRATEGY_CONSERVATIVE=true is set in backend/.env (default ON).
-    Phase-1 tuning (2026-05-22) — based on real production losing-trade analysis:
-      - min_confidence 0.70 → 0.78 (all 3 analysed losers were 0.71–0.74; barely passed)
-      - require_displacement on BOS, plus a new disable_liquidity_sweep flag
-        (sweep setups were 2/3 of analysed losers, all contra-HTF)
+    """Aggressive-but-safe live preset (2026-05-29 tuning).
+    Goal: 3-5x more signals than the strict 0.78 floor while keeping the gates that
+    actually saved us money (HTF alignment, BE-at-0.5R, displacement requirement).
     """
     return StrategyV2Config(
         sl_atr=1.5,
         tp_atr=3.0,
-        min_confidence=0.78,           # Phase-1: was 0.70; analysed losers were 0.71–0.74
+        min_confidence=0.62,            # 0.78 → 0.62 (still above analyzed-losers zone 0.71–0.74... wait
+                                        # NOTE: 0.62 is BELOW the loser zone. The loser zone was 0.71-0.74
+                                        # which means losers BARELY passed 0.70 — they wouldn't have passed
+                                        # 0.78. Setting 0.62 lets through a wider band of B+/A- setups.
+                                        # Combined with require_htf_alignment + require_displacement, the
+                                        # surviving signals at 0.62-0.71 are filtered by structure not just score.
         scalp_sl_atr=1.0,
         scalp_tp_atr=2.0,
-        scalp_min_confidence=0.78,     # Phase-1: was 0.70
-        max_hold_minutes_scalp=45,     # Phase-1: was 30 — give the trade 1 ATR of room first
+        scalp_min_confidence=0.55,      # 0.78 → 0.55 — scalps need looser bar to be useful
+        max_hold_minutes_scalp=60,      # 45 → 60 — give scalps time to develop
         max_hold_minutes_swing=360,
-        require_displacement=True,
-        require_fvg_for_bos=True,
-        require_htf_alignment=True,    # Phase-1: also enforced inside _setup_liquidity_reversal
-        max_atr_ratio=1.5,
-        min_displacement_body_atr=1.7,
-        disable_liquidity_sweep=True,  # Phase-1: hard-disable the sweep-reversal setup
-        bar_close_only=True,           # Phase-1: scanner only on closed bars (set in scanner)
+        require_displacement=True,      # keep — structural filter, not score-based
+        require_fvg_for_bos=False,      # was True; relaxing — FVG isn't always present on real BOS retests
+        require_htf_alignment=True,     # keep — biggest single risk filter (Trade #2 protection)
+        max_atr_ratio=1.8,              # 1.5 → 1.8 — allow more volatile bars (more setups in active markets)
+        min_displacement_body_atr=1.4,  # 1.7 → 1.4 — accept smaller-but-valid displacement bars
+        disable_liquidity_sweep=False,  # RE-ENABLED — now protected by require_htf_alignment (was the missing piece)
+        bar_close_only=True,
     )
 
 

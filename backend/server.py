@@ -303,7 +303,7 @@ class AdminUserPatch(BaseModel):
 # ---------- Constants ----------
 DEFAULT_STRATEGY = {
     "ema_fast": 21, "ema_slow": 55, "rsi_period": 14,
-    "atr_period": 14, "sl_atr": 1.5, "tp_atr": 2.5, "min_confidence": 0.5,
+    "atr_period": 14, "sl_atr": 1.5, "tp_atr": 2.5, "min_confidence": 0.4,
 }
 DEFAULT_SESSIONS = ["london", "new_york", "overlap"]
 PLAN_DAYS = {"monthly": 30, "quarterly": 90, "yearly": 365}
