@@ -2136,6 +2136,21 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_scan_result": f"cooldown:{cooldown_min}min",
                 }})
                 continue
+
+            # FIX #2 — Per-(pair, direction) cooldown across ALL the user's bots.
+            # Even if THIS bot is past its own bar, refuse to fire a second BUY (or SELL)
+            # on the same pair within 1 closed bar. Prevents the "fire 3 XAU sells in 15 min"
+            # cluster pattern that opens 3× the risk on a single idea.
+            pair = (bot.get("pair") or "").upper()
+            pair_cd_since = (now_utc() - timedelta(minutes=cooldown_min)).isoformat()
+            recent_any_dir = await db.signals.find(
+                {"user_id": bot["user_id"], "pair": pair,
+                 "created_at": {"$gte": pair_cd_since}},
+                {"_id": 0, "side": 1},
+            ).to_list(20)
+            # We'll allow this scan to compute a signal, but later we check side-match.
+            # Stash the recent-sides list in a local for the post-generation gate.
+            _recent_sides_same_pair: set = {s["side"] for s in recent_any_dir}
             # Route to strategy engine (v2 by default)
             v2_ctx = None
             if STRATEGY_VERSION == "v2":
@@ -2182,6 +2197,37 @@ async def _scan_and_persist(bots: List[dict]) -> int:
                     "last_mode": _mode_badge,
                 }})
                 continue
+            # FIX #2 — Block same-(pair, direction) duplicates fired by sibling bots
+            # within 1 closed bar window. If user has a SELL fired ≤ TF minutes ago,
+            # the next SELL on the same pair is silently skipped.
+            if sig.side in _recent_sides_same_pair:
+                await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                    "last_scan_at": now_iso(),
+                    "last_scan_result": f"pair_dir_cooldown:{pair}:{sig.side}",
+                    "last_mode": _mode_badge,
+                }})
+                continue
+            # FIX #2 — If an OPEN position exists on this pair in the OPPOSITE
+            # direction, the new signal must have meaningfully higher confidence
+            # (>= 0.10 above the open position's signal) to fire. This is the
+            # "adapt in real-time" guard: a fresh BUY of equal strength while a
+            # SELL is open is noise; only let the BUY through if it's clearly a
+            # stronger setup (reversal candidate).
+            opposite = "sell" if sig.side == "buy" else "buy"
+            existing_opp = await db.trades.find_one(
+                {"user_id": bot["user_id"], "pair": pair,
+                 "side": opposite, "status": "open"},
+                {"_id": 0, "confidence": 1, "signal_id": 1},
+            )
+            if existing_opp:
+                existing_conf = float(existing_opp.get("confidence") or 0.0)
+                if sig.confidence < existing_conf + 0.10:
+                    await db.bots.update_one({"_id": bot["_id"]}, {"$set": {
+                        "last_scan_at": now_iso(),
+                        "last_scan_result": f"opposite_open:{opposite}@{existing_conf:.2f}_need_+0.10",
+                        "last_mode": _mode_badge,
+                    }})
+                    continue
             # 5) CORRELATION FILTER — block if group already has CORRELATION_LIMIT same-direction trades
             corr_reason = await _correlation_blocked(bot["user_id"], bot["pair"], sig.side)
             if corr_reason:

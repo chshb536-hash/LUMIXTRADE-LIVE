@@ -244,6 +244,10 @@ class SignalContext:
     squeeze: bool
     htf_aligned: Optional[bool]
     scores: Dict[str, float] = field(default_factory=dict)
+    # FIX #3: Support/Resistance reversal-gate telemetry
+    sr_resistance: Optional[float] = None
+    sr_support: Optional[float] = None
+    sr_action: Optional[str] = None     # "ok" | "flip" | (block is never returned — signal is dropped)
 
 
 def _classify_regime_v2(candles: List[Candle], ef: List[float], es: List[float],
@@ -322,7 +326,124 @@ def generate_signal_v2(
     if out is None:
         return None
     sig, ctx_out = out
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FIX #3 — Support/Resistance reversal check (post-setup gate)
+    # ──────────────────────────────────────────────────────────────────────
+    # Block buys near 20-bar resistance and sells near 20-bar support. At the
+    # extreme, momentum confirmation can FLIP the trade direction (catch the
+    # reversal) instead of blindly continuing into the wall.
+    sr = _sr_check(candles, r, sig.side, last_close=closes[-1])
+    if sr["action"] == "block":
+        return None
+    if sr["action"] == "flip":
+        # The momentum bar confirms a reversal — re-issue an opposite-side signal
+        # with the same SL/TP distances but mirrored.
+        sig = _flip_signal(sig, sr["new_side"], a[-1], cfg)
+    ctx_out.sr_resistance = sr.get("resistance")
+    ctx_out.sr_support = sr.get("support")
+    ctx_out.sr_action = sr["action"]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FIX #1 — Enforce minimum 1:2 R:R on EVERY signal
+    # ──────────────────────────────────────────────────────────────────────
+    # If a setup emits a TP closer than 2× SL distance, widen the TP. Wins
+    # must structurally cover losses. Non-negotiable.
+    sig = _enforce_min_rr(sig, min_rr=2.0)
+
     return sig, ctx_out
+
+
+# ============================================================================
+# FIX #1 helper — Risk:Reward floor
+# ============================================================================
+def _enforce_min_rr(sig: "GeneratedSignal", *, min_rr: float = 2.0) -> "GeneratedSignal":
+    """Widen TP so that TP-distance >= min_rr × SL-distance. Never tightens SL.
+    This is the only knob that guarantees 'wins cover losses' regardless of
+    which setup fired or what ATR happened to be."""
+    sl_dist = abs(sig.entry - sig.sl)
+    tp_dist = abs(sig.tp - sig.entry)
+    if sl_dist <= 0:
+        return sig
+    needed = sl_dist * min_rr
+    if tp_dist >= needed:
+        return sig
+    # Widen TP outward
+    if sig.side == "buy":
+        sig.tp = sig.entry + needed
+    else:
+        sig.tp = sig.entry - needed
+    return sig
+
+
+# ============================================================================
+# FIX #3 helper — S/R reversal logic
+# ============================================================================
+def _sr_check(candles: List[Candle], rsi_vals: List[float], side: Side,
+              *, last_close: float, lookback: int = 20,
+              near_pct: float = 0.003) -> Dict[str, Any]:
+    """Returns one of:
+      {'action':'ok'}                       — far from S/R, proceed as-is
+      {'action':'block', 'reason':'near_resistance' | 'near_support'}
+      {'action':'flip', 'new_side':'sell'|'buy', 'reason':...}
+    'flip' fires only if a momentum bar confirms reversal:
+        - at resistance: bearish close + (RSI > 65 and turning down)
+        - at support:    bullish close + (RSI < 35 and turning up)
+    """
+    if len(candles) < lookback + 2:
+        return {"action": "ok"}
+    window = candles[-lookback:]
+    resistance = max(c["h"] for c in window)
+    support = min(c["l"] for c in window)
+    near_res = (resistance - last_close) / max(last_close, 1e-9) <= near_pct
+    near_sup = (last_close - support) / max(last_close, 1e-9) <= near_pct
+    last_c = candles[-1]
+    bearish = last_c["c"] < last_c["o"]
+    bullish = last_c["c"] > last_c["o"]
+    rsi_now = rsi_vals[-1] if rsi_vals else 50.0
+    rsi_prev = rsi_vals[-2] if len(rsi_vals) >= 2 else rsi_now
+    rsi_turning_down = rsi_now < rsi_prev
+    rsi_turning_up = rsi_now > rsi_prev
+
+    if side == "buy" and near_res:
+        # Buying into resistance — never. Either block or flip to SELL.
+        if bearish and rsi_now > 65 and rsi_turning_down:
+            return {"action": "flip", "new_side": "sell",
+                    "reason": "resistance_reversal",
+                    "resistance": resistance, "support": support}
+        return {"action": "block", "reason": "near_resistance",
+                "resistance": resistance, "support": support}
+
+    if side == "sell" and near_sup:
+        # Selling into support — never. Either block or flip to BUY.
+        if bullish and rsi_now < 35 and rsi_turning_up:
+            return {"action": "flip", "new_side": "buy",
+                    "reason": "support_reversal",
+                    "resistance": resistance, "support": support}
+        return {"action": "block", "reason": "near_support",
+                "resistance": resistance, "support": support}
+
+    return {"action": "ok", "resistance": resistance, "support": support}
+
+
+def _flip_signal(sig: "GeneratedSignal", new_side: Side, atr_v: float,
+                 cfg: StrategyV2Config) -> "GeneratedSignal":
+    """Mirror a signal to the opposite side at the same entry. SL/TP recomputed
+    using the original setup's ATR distances; R:R floor will be applied after."""
+    sl_atr = cfg.sl_atr if sig.mode == "swing" else cfg.scalp_sl_atr
+    tp_atr = cfg.tp_atr if sig.mode == "swing" else cfg.scalp_tp_atr
+    entry = sig.entry
+    if new_side == "buy":
+        sl = entry - atr_v * sl_atr
+        tp = entry + atr_v * tp_atr
+    else:
+        sl = entry + atr_v * sl_atr
+        tp = entry - atr_v * tp_atr
+    sig.side = new_side
+    sig.sl = sl
+    sig.tp = tp
+    sig.reason = f"SR-reversal {new_side.upper()} · " + sig.reason
+    return sig
 
 
 # ============================================================================

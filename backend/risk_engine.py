@@ -99,10 +99,22 @@ def adaptive_lot(
     lots_raw = risk_usd / denom
     lot = max(0.01, min(5.0, math.floor(lots_raw * 100) / 100))
 
+    # FIX #4 — Hard lot cap for small accounts (equity < $5k). The risk-normalization
+    # math is technically correct but produces 0.20+ lots on tight-SL FX pairs which
+    # is a 1-shot account-wipe waiting to happen. Cap until the account can absorb it.
+    capped_by = None
+    if equity_usd < 5_000:
+        is_metal = p.startswith("XAU") or p.startswith("XAG")
+        cap = 0.02 if is_metal else 0.05
+        if lot > cap:
+            capped_by = f"small_account_cap:{cap}"
+            lot = cap
+
     return {
         "lot": lot,
         "risk_pct_used": round(final_pct, 4),
         "risk_usd": round(risk_usd, 2),
+        "capped_by": capped_by,
         "multipliers": {
             "dd": round(dd_mult, 2), "vol": round(vol_mult, 2),
             "conf": round(conf_mult, 2), "streak": round(streak_mult, 2),

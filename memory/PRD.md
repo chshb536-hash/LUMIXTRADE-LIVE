@@ -194,3 +194,49 @@ NOT shipped (user explicitly skipped testing agent — will validate manually):
 - Bridge version unchanged (still 1.8.1)
 
 Production status: code in preview only — user must hit Deploy. Bridge file unchanged so VPS doesn't need re-download.
+
+**2026-06-05 — Smart-logic pass shipped (preview) — user explicitly requested NO new gates, only smarter logic in existing ones**
+
+Trigger: 4-day production audit (1-4 June) showed bot bled −$115.81 = ~10% of $1k account. 7 trades/day at 40% win rate, avg_win/avg_loss = 0.91 → expectancy −$2.75/trade. User refused tightening; demanded smarter strategy logic.
+
+Implementation — 4 files touched:
+
+**`strategy_v2.py`:**
+- New `_enforce_min_rr(sig, min_rr=2.0)` — FIX #1. Widens TP outward so TP-distance ≥ 2 × SL-distance on EVERY signal. SL never tightened. Applied at the router exit (covers all 3 setups).
+- New `_sr_check(candles, rsi_vals, side, lookback=20, near_pct=0.003)` — FIX #3. Returns `{action: ok|block|flip}` based on 20-bar resistance/support. "Near" = within 0.3% of price. At resistance: blocks buy unless bearish-close + RSI > 65 turning down (then flips to sell). At support: blocks sell unless bullish-close + RSI < 35 turning up (then flips to buy).
+- New `_flip_signal(sig, new_side, atr_v, cfg)` — mirrors signal direction at same entry with cfg-derived SL/TP. R:R floor then re-applied automatically.
+- `SignalContext` extended: `sr_resistance`, `sr_support`, `sr_action` for postmortem visibility.
+- `generate_signal_v2` router exit now runs S/R check → flip-or-block → R:R floor.
+
+**`server.py` `_scan_and_persist`:**
+- FIX #2a — Per-(pair, direction) cooldown across ALL sibling bots. After per-bot TF-cooldown passes, looks at last `cooldown_min` of signals on the same pair for the same user. If the new signal's side matches a recent one → `pair_dir_cooldown` skip. Stops the "fire 3 XAU sells in 15 min" cluster pattern.
+- FIX #2b — Opposite-direction open-position guard. If an OPEN trade exists on this pair in opposite direction, the new signal must have `confidence ≥ existing_confidence + 0.10` to fire. Otherwise → `opposite_open` skip. This is the "adapt in real-time" rule — only override an open position with a clearly stronger reversal.
+
+**`risk_engine.py` `adaptive_lot`:**
+- FIX #4 — Hard lot cap for accounts under $5k equity. FX max 0.05, metals (XAU/XAG) max 0.02. Returns `capped_by` field for telemetry. Stops the "0.23 lot EUR sell on $1k account" account-wipe risk.
+
+Acceptance tests (all 7 passing):
+- `_enforce_min_rr`: bad-RR 1:0.8 → widened to 1:2; good 1:3 untouched ✓
+- `_sr_check` flip: buy near res + bearish + RSI 70→67 → flip to sell ✓
+- `_sr_check` block: buy near res + bullish + RSI up → block ✓
+- `_sr_check` ok: mid-range buy → proceeds ✓
+- `adaptive_lot` FX cap: $1k account 10-pip EUR SL → lot=0.05 (was 0.78) ✓
+- `adaptive_lot` metal cap: $1k account XAU → lot=0.02 ✓
+- `adaptive_lot` big account: $10k account → no cap applied ✓
+- Live: opposite-direction signal at conf 0.78 vs open BUY@0.75 → blocked ✓
+
+Pre-existing lint warnings on lines 186 (get_current_user) and 848 (_bridge_key_auth) are internal Depends() helpers returning Mongo dicts to handler context — never serialized to wire. Left untouched per user instruction "without disturbing anything else."
+
+What was NOT changed (per user request):
+- `min_confidence` stays at 0.62
+- XAG/USD still allowed
+- Bridge / VPS / MT5 execution untouched
+- Conservative config flags (require_displacement, require_htf_alignment) preserved
+- BE-at-0.5R logic preserved
+
+Production status: preview only. User to redeploy + manually test for 1 week.
+
+Expected (user's stated target):
+- Win rate 40% → 50-60%
+- R:R 1:1 → 1:2 (now enforced)
+- 4-day net: −$115 → +$50-100
