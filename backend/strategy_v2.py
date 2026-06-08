@@ -387,6 +387,14 @@ def generate_signal_v2(
                 return None
 
     # ──────────────────────────────────────────────────────────────────────
+    # FIX — STRONG TREND BLOCK
+    # ──────────────────────────────────────────────────────────────────────
+    if sig.side == "sell" and _is_strong_uptrend(candles):
+        return None
+    if sig.side == "buy" and _is_strong_downtrend(candles):
+        return None
+
+    # ──────────────────────────────────────────────────────────────────────
     # FIX #1 — Enforce minimum 1:2 R:R on EVERY signal
     # ──────────────────────────────────────────────────────────────────────
     sig = _enforce_min_rr(sig, min_rr=2.0)
@@ -401,6 +409,24 @@ def generate_signal_v2(
 # ============================================================================
 # FIX #1 helper — Risk:Reward floor
 # ============================================================================
+def _is_strong_uptrend(bars, lookback=20, threshold=0.005):
+    closes = [b["c"] for b in bars[-lookback:]]
+    lowest = min(closes); highest = max(closes)
+    if highest == lowest: return False
+    net_change = (highest - lowest) / lowest
+    current_position = (bars[-1]["c"] - lowest) / (highest - lowest)
+    return net_change > threshold and current_position > 0.7
+
+
+def _is_strong_downtrend(bars, lookback=20, threshold=0.005):
+    closes = [b["c"] for b in bars[-lookback:]]
+    lowest = min(closes); highest = max(closes)
+    if highest == lowest: return False
+    net_change = (highest - lowest) / lowest
+    current_position = (bars[-1]["c"] - lowest) / (highest - lowest)
+    return net_change > threshold and current_position < 0.3
+
+
 def _enforce_min_rr(sig: "GeneratedSignal", *, min_rr: float = 2.0) -> "GeneratedSignal":
     """Widen TP so that TP-distance >= min_rr × SL-distance. Never tightens SL.
     This is the only knob that guarantees 'wins cover losses' regardless of
