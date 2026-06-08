@@ -240,3 +240,31 @@ Expected (user's stated target):
 - Win rate 40% → 50-60%
 - R:R 1:1 → 1:2 (now enforced)
 - 4-day net: −$115 → +$50-100
+
+**2026-06-08 — S/R logging + new "broken-resistance" guard (preview)**
+
+Trigger: user reported 4 losing SELL trades on 8 June believed to be S/R failures. Investigation showed:
+- The previous S/R logic IS deployed and IS running (RR + lot cap working confirms last deploy went through).
+- The trades were SELLs at the recent HIGH (resistance), which the prior code correctly ALLOWED (selling at resistance = correct direction). They lost because the broader uptrend then broke through resistance.
+- The user mistakenly labeled "4335 area" as support; it was actually resistance.
+
+Two changes:
+
+1. **Structured logging in `generate_signal_v2`** — every router exit now logs ONE of:
+   - `[S/R BLOCK] {SIDE} @ {price} · res={r} ({pct}%) sup={s} ({pct}%) · reason={reason}`
+   - `[S/R FLIP] {OLD}→{NEW} @ {price} · res={r} sup={s} · reason={reason}`
+   - `[S/R OK] {SIDE} @ {price} · res={r} ({pct}% away) sup={s} ({pct}% away)`
+   - `[SIGNAL FIRED] {SIDE} · conf={c} · regime={r} · sess={s} · entry/sl/tp · reason={reason}`
+   User can now `grep "S/R\|SIGNAL FIRED"` on backend logs to audit every decision.
+
+2. **FIX #3b — "Don't sell into freshly-broken resistance" (the real bug the user was hitting):**
+   - At router exit, check current bar's high/low against the PRIOR 19-bar window (excluding the current bar).
+   - If `sig.side="sell"` and `last_high > prev_high` → BLOCK (resistance just broke; trend continuation likely).
+   - If `sig.side="buy"` and `last_low < prev_low` → BLOCK (support just broke; downward continuation likely).
+   - Logs as: `[S/R BLOCK] SELL @ X rejected — current bar broke prev-resistance Y (last_high=Z)`
+
+Verified via forced-signal unit tests — all 3 log shapes fire correctly.
+
+Pre-existing lint flags on strategy_v2.py:53 (`l`) and :262 (`last_close`) untouched per user "don't disturb anything else" instruction.
+
+Production: code in preview only — user must redeploy. Bridge unchanged.

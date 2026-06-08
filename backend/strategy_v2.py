@@ -31,6 +31,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Literal
 import math
 import statistics
+import logging
+
+log = logging.getLogger("aurum.strategy_v2")
 
 from engine import (
     Candle, GeneratedSignal, Session, Regime, Side,
@@ -328,28 +331,69 @@ def generate_signal_v2(
     sig, ctx_out = out
 
     # ──────────────────────────────────────────────────────────────────────
-    # FIX #3 — Support/Resistance reversal check (post-setup gate)
+    # FIX #3 — Support/Resistance reversal check (post-setup gate) + LOGGING
     # ──────────────────────────────────────────────────────────────────────
-    # Block buys near 20-bar resistance and sells near 20-bar support. At the
-    # extreme, momentum confirmation can FLIP the trade direction (catch the
-    # reversal) instead of blindly continuing into the wall.
     sr = _sr_check(candles, r, sig.side, last_close=closes[-1])
+    sr_res = sr.get("resistance")
+    sr_sup = sr.get("support")
+    last_c = closes[-1]
+    # Compute distance-to-level as percent so logs are human-readable
+    res_dist_pct = ((sr_res - last_c) / last_c * 100) if sr_res else None
+    sup_dist_pct = ((last_c - sr_sup) / last_c * 100) if sr_sup else None
     if sr["action"] == "block":
+        log.info("[S/R BLOCK] %s @ %.5f · res=%.5f (%.2f%%) sup=%.5f (%.2f%%) · reason=%s",
+                 sig.side.upper(), last_c,
+                 sr_res or 0, res_dist_pct or 0,
+                 sr_sup or 0, sup_dist_pct or 0,
+                 sr.get("reason"))
         return None
     if sr["action"] == "flip":
-        # The momentum bar confirms a reversal — re-issue an opposite-side signal
-        # with the same SL/TP distances but mirrored.
+        old_side = sig.side
         sig = _flip_signal(sig, sr["new_side"], a[-1], cfg)
-    ctx_out.sr_resistance = sr.get("resistance")
-    ctx_out.sr_support = sr.get("support")
+        log.info("[S/R FLIP] %s→%s @ %.5f · res=%.5f sup=%.5f · reason=%s",
+                 old_side.upper(), sig.side.upper(), last_c,
+                 sr_res or 0, sr_sup or 0, sr.get("reason"))
+    else:
+        log.info("[S/R OK] %s @ %.5f · res=%.5f (%.2f%% away) sup=%.5f (%.2f%% away)",
+                 sig.side.upper(), last_c,
+                 sr_res or 0, res_dist_pct or 0,
+                 sr_sup or 0, sup_dist_pct or 0)
+    ctx_out.sr_resistance = sr_res
+    ctx_out.sr_support = sr_sup
     ctx_out.sr_action = sr["action"]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # FIX #3b (2026-06-08) — "Don't sell into a freshly-broken resistance"
+    # ──────────────────────────────────────────────────────────────────────
+    # Real production bug: SELLs were firing at resistance just as the trend
+    # was breaking through it. By the time SL hit, price had already made a
+    # new high. Block SELLs when the current bar broke ABOVE the 20-bar high
+    # (= resistance is no longer holding). Symmetric for BUYs below support.
+    if sr_res is not None and sr_sup is not None:
+        # Use prior-19-bar high so the current bar's break is detectable
+        prev_window = candles[-21:-1] if len(candles) >= 21 else candles[:-1]
+        if prev_window:
+            prev_high = max(c["h"] for c in prev_window)
+            prev_low = min(c["l"] for c in prev_window)
+            last_high = candles[-1]["h"]
+            last_low = candles[-1]["l"]
+            if sig.side == "sell" and last_high > prev_high:
+                log.info("[S/R BLOCK] SELL @ %.5f rejected — current bar broke prev-resistance %.5f (last_high=%.5f)",
+                         last_c, prev_high, last_high)
+                return None
+            if sig.side == "buy" and last_low < prev_low:
+                log.info("[S/R BLOCK] BUY @ %.5f rejected — current bar broke prev-support %.5f (last_low=%.5f)",
+                         last_c, prev_low, last_low)
+                return None
 
     # ──────────────────────────────────────────────────────────────────────
     # FIX #1 — Enforce minimum 1:2 R:R on EVERY signal
     # ──────────────────────────────────────────────────────────────────────
-    # If a setup emits a TP closer than 2× SL distance, widen the TP. Wins
-    # must structurally cover losses. Non-negotiable.
     sig = _enforce_min_rr(sig, min_rr=2.0)
+
+    log.info("[SIGNAL FIRED] %s · conf=%.2f · regime=%s · sess=%s · entry=%.5f sl=%.5f tp=%.5f · reason=%s",
+             sig.side.upper(), sig.confidence, sig.regime, sig.session,
+             sig.entry, sig.sl, sig.tp, sig.reason)
 
     return sig, ctx_out
 
